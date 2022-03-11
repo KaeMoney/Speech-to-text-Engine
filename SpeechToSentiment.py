@@ -8,11 +8,11 @@ from azure.ai.textanalytics import (
     AnalyzeSentimentAction,
 )
 
-credential = AzureKeyCredential("2b696be1f05941e08e836bd3cb35401d")
-endpoint="https://genexcognitive.cognitiveservices.azure.com/"
+credential = AzureKeyCredential("*********************")
+endpoint="**********************************"
 text_analytics_client = TextAnalyticsClient(endpoint, credential)
 
-speech_config = speechsdk.SpeechConfig(subscription='dd0ca7de2f5148b4a16f9a08b74623b0',
+speech_config = speechsdk.SpeechConfig(subscription='******************************',
                                        region='southafricanorth')
 speech_config.speech_recognition_language="en-US"
 # audio_config = speechsdk.audio.AudioConfig(filename=True)
