@@ -1,0 +1,92 @@
+import os
+import csv
+import json
+import sys
+import boto3
+import gzip
+from datetime import date, datetime, timedelta, timezone, time
+from io import StringIO, BytesIO
+
+def lambda_handler(event, context):
+    project = os.environ.get("VC_DP_PROJECT")
+    market = os.environ.get("VC_DP_MARKET")
+    environment = os.environ.get("VC_DP_ENVIRONMENT")
+
+    ssm_client = boto3.client("ssm")
+    config: dict = json.loads(ssm_client.get_parameter(Name=f"/Producer/{project}/{environment.capitalize()}/{market.capitalize()}/DiscrepancyConfig")['Parameter']['Value'])
+
+    # Data extraction from validation file
+    validation_data = {}
+    s3_client = boto3.client("s3")
+    cw_client = boto3.client("cloudwatch")
+    records = event.get("Records", [])
+    for record in records:
+        validation_file = record["s3"]["object"]["key"]
+        bucket_name = record["s3"]["bucket"]["name"]
+
+        base_prefix = 'Data-Validation-Files'
+        streams = config.get(base_prefix, [])
+        validation_lines = [stream.get("validation", None) for stream in streams]
+        
+        
+        if validation_file is not None and validation_file.endswith(".csv"):
+            csv_s3_object = s3_client.get_object(Bucket=bucket_name, Key=validation_file)
+            csv_reader = csv.reader(StringIO(csv_s3_object['Body'].read().decode("utf-8")), delimiter=",")
+            for row in csv_reader:
+                ft_name = row[0]
+                ft_date = row[1]
+                records = row[4]
+                if ft_name in validation_lines:
+                    validation_data[ft_name] = {"name": ft_name, "date": date.fromisoformat(ft_date), "records": int(records)}
+        
+
+        # Data lookup
+        for stream in streams:
+            dirname = stream.get("directory", None)
+            stream_validation = validation_data.get(stream.get("validation", None), None)
+            if dirname is not None and stream_validation is not None:
+                records = 0
+                s3_prefix = f"{dirname}"
+                bucket_contents = []
+                next_token = ""
+                while True:
+                    params = {
+                        "Bucket": bucket_name,
+                        "Prefix": s3_prefix
+                    }
+                    if next_token != "":
+                        params["ContinuationToken"] = next_token
+                    list_s3 = s3_client.list_objects_v2(**params)
+                    bucket_contents = bucket_contents + list_s3["Contents"]
+                    next_token = list_s3.get("NextContinuationToken", "")
+                    if next_token == "":
+                        break
+                validation_date = stream_validation["date"]
+             
+                for content in bucket_contents:
+                    s3_key = content['Key']
+                    if validation_date.strftime("%Y%m%d") in str(s3_key) and ".gz" in str(s3_key):
+                        data_file = BytesIO(s3_client.get_object(Bucket=bucket_name, Key=s3_key)['Body'].read())
+                        with gzip.open(data_file, "rt") as f:
+                            records += len(f.readlines()) - 1 # We remove a line because all files contains a header line
+                discrepancy = stream_validation["records"] - records
+                validationCount= stream_validation["records"]
+                print(f"Stream: {stream.get('validation', '')}. Discrepancy: {discrepancy}")
+                
+                if discrepancy != 0:
+                    sys.exit(1)
+                cw_client.put_metric_data(
+                    Namespace="VCDP/Discrepancy",
+                    MetricData=[{
+                        "MetricName": stream.get("validation", ""),
+                        "Dimensions": [
+                            {"Name": "Project", "Value": project},
+                            {"Name": "Market", "Value": market},
+                            {"Name": "Environment", "Value": environment},
+                            {"Name": "UseCase", "Value": base_prefix}
+                        ],
+                        "Timestamp": datetime.combine(validation_date, datetime.utcnow().timetz(), timezone.utc),
+                        "Value": float(discrepancy),
+                        "Unit": "Count"
+                    }]
+                )
